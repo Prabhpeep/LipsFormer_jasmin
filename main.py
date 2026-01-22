@@ -26,13 +26,12 @@ from optimizer import build_optimizer
 from logger import create_logger
 from utils import load_checkpoint, save_checkpoint, load_pretrained, get_grad_norm, auto_resume_helper, reduce_tensor
 
-import bai
+# Attempt to import bai, handle failure gracefully if not present
+try:
+    import bai
+except ImportError:
+    bai = None
 
-# try:
-#     # noinspection PyUnresolvedReferences
-#     from apex import amp
-# except ImportError:
-#     amp = None
 from torch.cuda import amp
 from torch.cuda.amp import autocast as autocast
 
@@ -68,6 +67,9 @@ def parse_option():
     parser.add_argument('--epochs', default=100, type=int, help='Perform evaluation only')
     parser.add_argument('--throughput', action='store_true', help='Test throughput only')
 
+    # [PATCH] Add JaSMin Argument
+    parser.add_argument('--jasmin-lambda', type=float, default=0.0, help='Weight for JaSMin regularization')
+
     # distributed training
     parser.add_argument("--local_rank", type=int, required=True, help='local rank for DistributedDataParallel')
 
@@ -84,9 +86,6 @@ def main(config):
 
     dataset_train, dataset_val, data_loader_train, data_loader_val, mixup_fn = build_loader(config)
 
-    # dataset_train, data_loader_train, mixup_fn = build_22k_loader(config)
-
-
     logger.info(f"Creating model:{config.MODEL.TYPE}/{config.MODEL.NAME}")
     model = build_model(config)
 
@@ -99,7 +98,7 @@ def main(config):
     optimizer = build_optimizer(config, model)
     if config.AMP_OPT_LEVEL != "O0":
         pass
-    #    model, optimizer = amp.initialize(model, optimizer, opt_level=config.AMP_OPT_LEVEL)
+    
     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[config.LOCAL_RANK], broadcast_buffers=False)
     model_without_ddp = model.module
 
@@ -112,7 +111,6 @@ def main(config):
     lr_scheduler = build_scheduler(config, optimizer, len(data_loader_train))
 
     if config.AUG.MIXUP > 0.:
-        # smoothing is handled with mixup label transform
         criterion = SoftTargetCrossEntropy()
     elif config.MODEL.LABEL_SMOOTHING > 0.:
         criterion = LabelSmoothingCrossEntropy(smoothing=config.MODEL.LABEL_SMOOTHING)
@@ -135,7 +133,6 @@ def main(config):
 
     if config.MODEL.RESUME:
         max_accuracy = load_checkpoint(config, model_without_ddp, optimizer, lr_scheduler, logger)
-
         if data_loader_val:
             acc1, acc5, loss = validate(config, data_loader_val, model)
             logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
@@ -144,7 +141,6 @@ def main(config):
 
     if config.MODEL.PRETRAINED and (not config.MODEL.RESUME):
         load_pretrained(config, model_without_ddp, logger)
-
 
     if config.THROUGHPUT_MODE:
         throughput(data_loader_val, model, logger)
@@ -179,12 +175,15 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
     loss_meter = AverageMeter()
     norm_meter = AverageMeter()
 
-    # torch.amp scaler
     if config.AMP_OPT_LEVEL != "O0":
         scaler = torch.cuda.amp.GradScaler()
 
     start = time.time()
     end = time.time()
+    
+    # [PATCH] Retrieve lambda safely (default to 0.0 if not set)
+    jasmin_lambda = getattr(config.TRAIN, 'JASMIN_LAMBDA', 0.0)
+
     for idx, (samples, targets) in enumerate(data_loader):
         samples = samples.cuda(non_blocking=True)
         targets = targets.cuda(non_blocking=True)
@@ -195,22 +194,28 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
         with autocast():
             outputs = model(samples)
             loss = criterion(outputs, targets)
+            
+            # [PATCH] Inject JaSMin Regularization
+            # We handle DDP (model.module) or standard model
+            if jasmin_lambda > 0:
+                # Check for DDP wrapper ('module')
+                if hasattr(model, 'module'):
+                    reg_loss = model.module.jasmin_loss()
+                else:
+                    reg_loss = model.jasmin_loss()
+                
+                # Note: reg_loss is negative (log likelihood bound), so we ADD it 
+                # (minimizing a negative value pushes it lower/more negative -> better sparsity)
+                loss = loss + jasmin_lambda * reg_loss
 
         if config.TRAIN.ACCUMULATION_STEPS > 1:
-            #loss = criterion(outputs, targets)
             loss = loss / config.TRAIN.ACCUMULATION_STEPS
             if config.AMP_OPT_LEVEL != "O0":
-                #with amp.scale_loss(loss, optimizer) as scaled_loss:
-                #    scaled_loss.backward()
                 scaler.scale(loss).backward()
                 if config.TRAIN.CLIP_GRAD:
-                    #grad_norm = torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), config.TRAIN.CLIP_GRAD)
-
-                    # Unscales the gradients of optimizer's assigned params in-place
                     scaler.unscale_(optimizer)
                     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.TRAIN.CLIP_GRAD)
                 else:
-                    #grad_norm = get_grad_norm(amp.master_params(optimizer))
                     grad_norm = get_grad_norm(model.parameters())
             else:
                 loss.backward()
@@ -219,26 +224,18 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
                 else:
                     grad_norm = get_grad_norm(model.parameters())
             if (idx + 1) % config.TRAIN.ACCUMULATION_STEPS == 0:
-                #optimizer.step()
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
                 lr_scheduler.step_update(epoch * num_steps + idx)
         else:
-            #loss = criterion(outputs, targets)
             optimizer.zero_grad()
             if config.AMP_OPT_LEVEL != "O0":
-                #with amp.scale_loss(loss, optimizer) as scaled_loss:
-                #    scaled_loss.backward()
                 scaler.scale(loss).backward()
                 if config.TRAIN.CLIP_GRAD:
-                    #grad_norm = torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), config.TRAIN.CLIP_GRAD)
-
-                    # Unscales the gradients of optimizer's assigned params in-place
                     scaler.unscale_(optimizer)
                     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.TRAIN.CLIP_GRAD)
                 else:
-                    #grad_norm = get_grad_norm(amp.master_params(optimizer))
                     grad_norm = get_grad_norm(model.parameters())
             else:
                 loss.backward()
@@ -246,7 +243,6 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
                     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.TRAIN.CLIP_GRAD)
                 else:
                     grad_norm = get_grad_norm(model.parameters())
-            #optimizer.step()
             scaler.step(optimizer)
             scaler.update()
             lr_scheduler.step_update(epoch * num_steps + idx)
@@ -271,7 +267,7 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
                 f'mem {memory_used:.0f}MB')
     epoch_time = time.time() - start
 
-    if dist.get_rank() == 0:
+    if dist.get_rank() == 0 and bai is not None:
         bai.text(f"{config.TAG} \n epoch: {epoch}  loss: {loss_meter.avg:.4f}, grad norm: {norm_meter.avg:.4f} ")
 
     logger.info(f"EPOCH {epoch} training takes {datetime.timedelta(seconds=int(epoch_time))}")
@@ -291,10 +287,8 @@ def validate(config, data_loader, model, epoch=0):
         images = images.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)
 
-        # compute output
         output = model(images)
 
-        # measure accuracy and record loss
         loss = criterion(output, target)
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
 
@@ -306,7 +300,6 @@ def validate(config, data_loader, model, epoch=0):
         acc1_meter.update(acc1.item(), target.size(0))
         acc5_meter.update(acc5.item(), target.size(0))
 
-        # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
 
@@ -321,7 +314,7 @@ def validate(config, data_loader, model, epoch=0):
                 f'Mem {memory_used:.0f}MB')
     logger.info(f' * Acc@1 {acc1_meter.avg:.3f} Acc@5 {acc5_meter.avg:.3f}')
 
-    if epoch % 10 == 0 and dist.get_rank() == 0:
+    if epoch % 10 == 0 and dist.get_rank() == 0 and bai is not None:
         bai.text(f"{config.TAG} \n epoch: {epoch}  * Acc@1 {acc1_meter.avg:.3f}")
 
     return acc1_meter.avg, acc5_meter.avg, loss_meter.avg
@@ -330,7 +323,6 @@ def validate(config, data_loader, model, epoch=0):
 @torch.no_grad()
 def throughput(data_loader, model, logger):
     model.eval()
-
     for idx, (images, _) in enumerate(data_loader):
         images = images.cuda(non_blocking=True)
         batch_size = images.shape[0]
@@ -346,12 +338,17 @@ def throughput(data_loader, model, logger):
         logger.info(f"batch_size {batch_size} throughput {30 * batch_size / (tic2 - tic1)}")
         return
 
-
 if __name__ == '__main__':
-    _, config = parse_option()
+    args, config = parse_option()
+    
+    # [PATCH] Inject argument into Config (Defrost, Add, Freeze)
+    config.defrost()
+    config.TRAIN.JASMIN_LAMBDA = args.jasmin_lambda
+    config.freeze()
 
     if config.AMP_OPT_LEVEL != "O0":
-        assert amp is not None, "amp not installed!"
+        pass 
+        # assert amp is not None, "amp not installed!"
 
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         rank = int(os.environ["RANK"])
@@ -370,11 +367,10 @@ if __name__ == '__main__':
     np.random.seed(seed)
     cudnn.benchmark = True
 
-    # linear scale the learning rate according to total batch size, may not be optimal
     linear_scaled_lr = config.TRAIN.BASE_LR * config.DATA.BATCH_SIZE * dist.get_world_size() / 512.0
     linear_scaled_warmup_lr = config.TRAIN.WARMUP_LR * config.DATA.BATCH_SIZE * dist.get_world_size() / 512.0
     linear_scaled_min_lr = config.TRAIN.MIN_LR * config.DATA.BATCH_SIZE * dist.get_world_size() / 512.0
-    # gradient accumulation also need to scale the learning rate
+    
     if config.TRAIN.ACCUMULATION_STEPS > 1:
         linear_scaled_lr = linear_scaled_lr * config.TRAIN.ACCUMULATION_STEPS
         linear_scaled_warmup_lr = linear_scaled_warmup_lr * config.TRAIN.ACCUMULATION_STEPS
@@ -394,7 +390,5 @@ if __name__ == '__main__':
             f.write(config.dump())
         logger.info(f"Full config saved to {path}")
 
-    # print config
     logger.info(config.dump())
-
     main(config)

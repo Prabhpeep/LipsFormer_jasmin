@@ -76,14 +76,10 @@ class WindowAttention(nn.Module):
         self.softmax = nn.Softmax(dim=-1)
 
     def _jasmin_norm(self, attn, eps=1e-12):
-        if attn.shape[-1] < 2:
-            return torch.tensor(0.0, device=attn.device, dtype=attn.dtype)
-        top2, _ = torch.topk(attn, k=2, dim=-1)
-        x1, x2 = top2[..., 0], top2[..., 1]
-        g1 = torch.clamp(x1 * (1.0 - x1 + x2), min=eps)
-        log_g1 = torch.log(g1) 
-        per_head_max = torch.max(log_g1, dim=-1).values 
-        return per_head_max.max(dim=1).values.mean()
+            a_max, _ = attn.max(dim=-1)
+            a_max = torch.clamp(a_max, 0.0, 1.0)
+            per_token = torch.sqrt(a_max * (1.0 - a_max) + eps)
+            return per_token.mean()
 
     def forward(self, x, mask=None):
         B_, N, C = x.shape

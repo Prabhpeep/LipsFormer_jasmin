@@ -11,29 +11,6 @@ import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 
-
-class ConvProjection(nn.Module):
-    def __init__(self, dim, out_features=None):
-        super().__init__()
-        self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim) # depthwise conv
-        if out_features is None:
-            out_features = dim
-        self.pwconv1 = nn.Conv2d(dim, out_features, kernel_size=1) # pointwise/1x1 convs, implemented with linear layers
-        
-    def forward(self, x):
-        out = self.dwconv(x)
-        out = self.pwconv1(out)
-        return out
-
-class DWConvLayer(nn.Module):
-    def __init__(self, dim, out_features=None):
-        super().__init__()
-        self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim) # 
-    def forward(self, x):
-        out = self.dwconv(x)
-        out = out + x
-        return out
-
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
@@ -43,7 +20,6 @@ class Mlp(nn.Module):
         self.act = act_layer()
         self.fc2 = nn.Linear(hidden_features, out_features)
         self.drop = nn.Dropout(drop)
-
     def forward(self, x):
         x = self.fc1(x)
         x = self.act(x)
@@ -58,24 +34,11 @@ class ScaleLayer(nn.Module):
         self.alpha = alpha
         self.learnable = learnable
         self.dim = dim
-        if self.learnable:
-            self.scale = nn.Parameter(torch.ones(dim) * self.alpha)
-        else:
-            self.scale = self.alpha
-
+        self.scale = nn.Parameter(torch.ones(dim) * self.alpha) if learnable else self.alpha
     def forward(self, x):
-        if self.learnable:
-            y = self.scale[None, None, :]*x
-        else:
-            y = self.scale*x
-        return  y
-
-    def __repr__(self):
-        return f"ScaleLayer(alpha={self.alpha}, learnable={self.learnable}, dim={self.dim})"
-
+        return self.scale[None, None, :]*x if self.learnable else self.scale*x
 
 class CenterNorm(nn.Module):
-    r""" CenterNorm that supports two data formats: channels_last (default) or channels_first. """
     def __init__(self, normalized_shape, eps=1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(normalized_shape))
@@ -87,16 +50,11 @@ class CenterNorm(nn.Module):
         x = self.weight[None, None, :] * x + self.bias[None, None, :]
         return x
 
-    def __repr__(self):
-        return "CenterNorm()"
-
-
 def window_partition(x, window_size):
     B, H, W, C = x.shape
     x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
     windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
     return windows
-
 
 def window_reverse(windows, window_size, H, W):
     B = int(windows.shape[0] / (H * W / window_size / window_size))
@@ -104,22 +62,16 @@ def window_reverse(windows, window_size, H, W):
     x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
     return x
 
-
 class WindowAttention(nn.Module):
-    r""" Window based multi-head self attention (W-MSA) module with relative position bias. """
-
     def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
-
         super().__init__()
         self.dim = dim
-        self.window_size = window_size  # Wh, Ww
+        self.window_size = window_size
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = qk_scale or head_dim ** -0.5
-
         self.relative_position_bias_table = nn.Parameter(
             torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads)) 
-
         coords_h = torch.arange(self.window_size[0])
         coords_w = torch.arange(self.window_size[1])
         coords = torch.stack(torch.meshgrid([coords_h, coords_w])) 
@@ -131,57 +83,38 @@ class WindowAttention(nn.Module):
         relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
         relative_position_index = relative_coords.sum(-1) 
         self.register_buffer("relative_position_index", relative_position_index)
-
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
-
         trunc_normal_(self.relative_position_bias_table, std=.02)
         self.softmax = nn.Softmax(dim=-1)
 
-    # Jasmin Helper
+    # === [PATCH] Faithful JaSMin Helper (Robust) ===
     def _jasmin_norm(self, attn, eps=1e-12):
-        """
-        Calculates JaSMin regularization (Softmax Jacobian Norm).
-        Max over heads, Mean over batch.
-        """
-        # 1. Get top 2 probabilities per row
-        # attn shape: (B, NumHeads, N, N)
+        # Safety Check: If window size shrunk to 1x1, we can't find top-2
+        if attn.shape[-1] < 2:
+            return torch.tensor(0.0, device=attn.device, dtype=attn.dtype)
+
         top2, _ = torch.topk(attn, k=2, dim=-1)
         x1, x2 = top2[..., 0], top2[..., 1]
-
-        # 2. Compute Jacobian bound g1
-        # g1 is in [0, 0.25]. We want g1 -> 0.
         g1 = torch.clamp(x1 * (1.0 - x1 + x2), min=eps)
-        
-        # 3. Log-space for numerical stability
         log_g1 = torch.log(g1) 
-
-        # 4. Max over tokens (worst-case token per head)
-        # log_g1 is negative. The 'max' is the value closest to 0 (least sparse).
         per_head_max = torch.max(log_g1, dim=-1).values 
-
-        # 5. AGGREGATION: Max over heads, Mean over batch
-        # We target the worst-performing head (max value).
         return per_head_max.max(dim=1).values.mean()
-    
+    # ===============================================
 
     def forward(self, x, mask=None):
         B_, N, C = x.shape
         qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-
         q = F.normalize(q, p=2.0, dim=-1)
         k = F.normalize(k, p=2.0, dim=-1)
-
         attn = 10.0*(q @ k.transpose(-2, -1))
-
         relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
             self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1) 
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous() 
         attn = attn + relative_position_bias.unsqueeze(0)
-
         if mask is not None:
             nW = mask.shape[0]
             attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
@@ -190,13 +123,10 @@ class WindowAttention(nn.Module):
         else:
             attn = checkpoint.checkpoint(self.softmax, attn)
 
-        #  JaSMin Hook
         if self.training:
              self.last_jasmin = self._jasmin_norm(attn)
-        
 
         attn = self.attn_drop(attn)
-
         x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -204,7 +134,6 @@ class WindowAttention(nn.Module):
 
     def extra_repr(self) -> str:
         return f'dim={self.dim}, window_size={self.window_size}, num_heads={self.num_heads}'
-
     def flops(self, N):
         flops = 0
         flops += N * self.dim * 3 * self.dim
@@ -212,7 +141,6 @@ class WindowAttention(nn.Module):
         flops += self.num_heads * N * N * (self.dim // self.num_heads)
         flops += N * self.dim * self.dim
         return flops
-
 
 class SwinTransformerBlock(nn.Module):
     def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
@@ -229,36 +157,27 @@ class SwinTransformerBlock(nn.Module):
             self.shift_size = 0
             self.window_size = min(self.input_resolution)
         assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
-
         self.attn = WindowAttention(
             dim, window_size=to_2tuple(self.window_size), num_heads=num_heads,
             qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
-
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
-
         if self.shift_size > 0:
             H, W = self.input_resolution
             img_mask = torch.zeros((1, H, W, 1))
-            h_slices = (slice(0, -self.window_size),
-                        slice(-self.window_size, -self.shift_size),
-                        slice(-self.shift_size, None))
-            w_slices = (slice(0, -self.window_size),
-                        slice(-self.window_size, -self.shift_size),
-                        slice(-self.shift_size, None))
+            h_slices = (slice(0, -self.window_size), slice(-self.window_size, -self.shift_size), slice(-self.shift_size, None))
+            w_slices = (slice(0, -self.window_size), slice(-self.window_size, -self.shift_size), slice(-self.shift_size, None))
             cnt = 0
             for h in h_slices:
                 for w in w_slices:
                     img_mask[:, h, w, :] = cnt
                     cnt += 1
-
             mask_windows = window_partition(img_mask, self.window_size) 
             mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
             attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
             attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
         else:
             attn_mask = None
-
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
@@ -269,7 +188,6 @@ class SwinTransformerBlock(nn.Module):
         self.dwconv_layers = nn.ModuleList()
         self.scale_layers = nn.ModuleList()
         self.gelus = nn.ModuleList()
-
         for i in range(dw_conv_layer):
             self.dwconv_layers.append(nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim))
             self.scale_layers.append(ScaleLayer(dim=dim, alpha=1./num_layers))
@@ -279,7 +197,6 @@ class SwinTransformerBlock(nn.Module):
         self.nin = nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0)
         self.gelu2 = nn.GELU()
         self.register_buffer("attn_mask", attn_mask)
-
     def forward(self, x):
         H, W = self.input_resolution
         B, L, C = x.shape
@@ -317,11 +234,9 @@ class SwinTransformerBlock(nn.Module):
         x = x + self.drop_path1(self.alpha2(checkpoint.checkpoint(self.mlp, x)))
         x = self.norm2(x)
         return x
-
     def extra_repr(self) -> str:
         return f"dim={self.dim}, input_resolution={self.input_resolution}, num_heads={self.num_heads}, " \
                f"window_size={self.window_size}, shift_size={self.shift_size}, mlp_ratio={self.mlp_ratio}"
-
     def flops(self):
         flops = 0
         H, W = self.input_resolution
@@ -427,7 +342,7 @@ class PatchEmbed(nn.Module):
     def forward(self, x):
         B, C, H, W = x.shape
         assert H == self.img_size[0] and W == self.img_size[1], \
-            f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
+            f"Input image size ({{H}}*{{W}}) doesn't match model ({{self.img_size[0]}}*{{self.img_size[1]}})."
         x = self.proj(x).flatten(2).transpose(1, 2)
         if self.norm is not None:
             x = self.norm(x)
@@ -502,7 +417,6 @@ class LipsFormerSwin(nn.Module):
         elif isinstance(m, (nn.LayerNorm, CenterNorm, nn.BatchNorm2d)):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
-
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             trunc_normal_(m.weight, std=.02)
@@ -511,15 +425,12 @@ class LipsFormerSwin(nn.Module):
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
-
     @torch.jit.ignore
     def no_weight_decay(self):
         return {'absolute_pos_embed'}
-
     @torch.jit.ignore
     def no_weight_decay_keywords(self):
         return {'relative_position_bias_table'}
-
     def forward_features(self, x):
         x = self.patch_embed(x)
         if self.ape:
@@ -531,21 +442,19 @@ class LipsFormerSwin(nn.Module):
         x = self.avgpool(x.transpose(1, 2))
         x = torch.flatten(x, 1)
         return x
-
     def forward(self, x):
         x = self.forward_features(x)
         x = self.head(x)
         return x
-    
-    #  Loss Collector
+
+    # === [PATCH] Loss Collector ===
     def jasmin_loss(self):
         loss = 0.0
-        # Recursively sum up the 'last_jasmin' from all attention layers
         for module in self.modules():
             if hasattr(module, 'last_jasmin'):
                 loss += module.last_jasmin
         return loss
-   
+    # ==============================
 
     def flops(self):
         flops = 0

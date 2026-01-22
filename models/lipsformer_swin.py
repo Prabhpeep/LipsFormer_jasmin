@@ -1,6 +1,4 @@
-# --------------------------------------------------------
-# Swin Transformer - Checkpointing REMOVED for PGD Compatibility
-# --------------------------------------------------------
+# models/lipsformer_swin.py
 
 import torch
 import torch.nn as nn
@@ -34,17 +32,8 @@ class ScaleLayer(nn.Module):
     def forward(self, x):
         return self.scale[None, None, :]*x if self.learnable else self.scale*x
 
-class CenterNorm(nn.Module):
-    def __init__(self, normalized_shape, eps=1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(normalized_shape))
-        self.bias = nn.Parameter(torch.zeros(normalized_shape))
-        self.scale = normalized_shape/(normalized_shape-1.0)
-    def forward(self, x):
-        u = x.mean(-1, keepdim=True)
-        x = self.scale*(x - u)
-        x = self.weight[None, None, :] * x + self.bias[None, None, :]
-        return x
+# --- MODIFIED: Standard LayerNorm used instead of CenterNorm ---
+# CenterNorm class removed to prevent accidental usage
 
 def window_partition(x, window_size):
     B, H, W, C = x.shape
@@ -86,19 +75,15 @@ class WindowAttention(nn.Module):
         trunc_normal_(self.relative_position_bias_table, std=.02)
         self.softmax = nn.Softmax(dim=-1)
 
-    # === [PATCH] Faithful JaSMin Helper (Robust + Safe) ===
     def _jasmin_norm(self, attn, eps=1e-12):
-        # Safety Check: If window size shrunk to 1x1, we can't find top-2
         if attn.shape[-1] < 2:
             return torch.tensor(0.0, device=attn.device, dtype=attn.dtype)
-
         top2, _ = torch.topk(attn, k=2, dim=-1)
         x1, x2 = top2[..., 0], top2[..., 1]
         g1 = torch.clamp(x1 * (1.0 - x1 + x2), min=eps)
         log_g1 = torch.log(g1) 
         per_head_max = torch.max(log_g1, dim=-1).values 
         return per_head_max.max(dim=1).values.mean()
-    # ===============================================
 
     def forward(self, x, mask=None):
         B_, N, C = x.shape
@@ -112,15 +97,15 @@ class WindowAttention(nn.Module):
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous() 
         attn = attn + relative_position_bias.unsqueeze(0)
         
-        # --- FIXED: Removed checkpoint.checkpoint ---
         if mask is not None:
             nW = mask.shape[0]
             attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
             attn = attn.view(-1, self.num_heads, N, N)
-            attn = self.softmax(attn) # Direct call
+            attn = self.softmax(attn)
         else:
-            attn = self.softmax(attn) # Direct call
+            attn = self.softmax(attn)
 
+        # Store loss term for collection later
         if self.training:
              self.last_jasmin = self._jasmin_norm(attn)
 
@@ -143,7 +128,7 @@ class WindowAttention(nn.Module):
 class SwinTransformerBlock(nn.Module):
     def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
-                 act_layer=nn.GELU, norm_layer=CenterNorm, dw_conv_layer=2, num_layers=12):
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm, dw_conv_layer=2, num_layers=12):
         super().__init__()
         self.dim = dim
         self.input_resolution = input_resolution
@@ -195,6 +180,7 @@ class SwinTransformerBlock(nn.Module):
         self.nin = nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0)
         self.gelu2 = nn.GELU()
         self.register_buffer("attn_mask", attn_mask)
+
     def forward(self, x):
         H, W = self.input_resolution
         B, L, C = x.shape
@@ -206,12 +192,10 @@ class SwinTransformerBlock(nn.Module):
                 x = x.transpose(-2, -1).contiguous().view(B, C, H, W)
                 x = deconv(x)
                 if i == 0:
-                    # --- FIXED: Removed checkpoint.checkpoint ---
                     x = self.gelu2(x) 
                     x = self.nin(x)
                     i = i + 1
                 x = x.view(B, C, -1).transpose(-2, -1).contiguous()
-                # --- FIXED: Removed checkpoint.checkpoint ---
                 x = tmp_x + self.drop_path2(scale(act(x)))
 
         shortcut = x
@@ -232,13 +216,14 @@ class SwinTransformerBlock(nn.Module):
         x = x.view(B, H * W, C)
         x = shortcut + self.drop_path(self.alpha1(x))
         x = self.norm1(x)
-        # --- FIXED: Removed checkpoint.checkpoint ---
         x = x + self.drop_path1(self.alpha2(self.mlp(x)))
         x = self.norm2(x)
         return x
+
     def extra_repr(self) -> str:
         return f"dim={self.dim}, input_resolution={self.input_resolution}, num_heads={self.num_heads}, " \
                f"window_size={self.window_size}, shift_size={self.shift_size}, mlp_ratio={self.mlp_ratio}"
+
     def flops(self):
         flops = 0
         H, W = self.input_resolution
@@ -255,7 +240,7 @@ class SwinTransformerBlock(nn.Module):
         return flops
 
 class PatchMerging(nn.Module):
-    def __init__(self, input_resolution, dim, norm_layer=CenterNorm):
+    def __init__(self, input_resolution, dim, norm_layer=nn.LayerNorm):
         super().__init__()
         self.input_resolution = input_resolution
         self.dim = dim
@@ -285,7 +270,7 @@ class PatchMerging(nn.Module):
 class BasicLayer(nn.Module):
     def __init__(self, dim, input_resolution, depth, num_heads, window_size,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., norm_layer=CenterNorm, downsample=None, use_checkpoint=False, num_layers=12):
+                 drop_path=0., norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False, num_layers=12):
         super().__init__()
         self.dim = dim
         self.input_resolution = input_resolution
@@ -307,7 +292,6 @@ class BasicLayer(nn.Module):
             self.downsample = None
     def forward(self, x):
         for blk in self.blocks:
-            # --- FIXED: Removed checkpointing condition ---
             x = blk(x)
         if self.downsample is not None:
             x = self.downsample(x)
@@ -359,7 +343,7 @@ class LipsFormerSwin(nn.Module):
                  embed_dim=96, depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24],
                  window_size=7, mlp_ratio=4., qkv_bias=True, qk_scale=None,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
-                 norm_layer=CenterNorm, ape=False, patch_norm=True,
+                 norm_layer=nn.LayerNorm, ape=False, patch_norm=True,
                  use_checkpoint=False, **kwargs):
         super().__init__()
         self.num_classes = num_classes
@@ -414,9 +398,10 @@ class LipsFormerSwin(nn.Module):
             weight = torch.reshape(m.weight.data, (m.weight.data.shape[0], -1))
             u,s,v = torch.svd(weight)
             m.weight.data = m.weight.data/s[0]
-        elif isinstance(m, (nn.LayerNorm, CenterNorm, nn.BatchNorm2d)):
+        elif isinstance(m, (nn.LayerNorm, nn.BatchNorm2d)):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
+
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             trunc_normal_(m.weight, std=.02)
@@ -447,14 +432,12 @@ class LipsFormerSwin(nn.Module):
         x = self.head(x)
         return x
 
-    # === [PATCH] Loss Collector ===
     def jasmin_loss(self):
         loss = 0.0
         for module in self.modules():
             if hasattr(module, 'last_jasmin'):
                 loss += module.last_jasmin
         return loss
-    # ==============================
 
     def flops(self):
         flops = 0

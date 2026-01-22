@@ -1,14 +1,10 @@
 # --------------------------------------------------------
-# Swin Transformer
-# Copyright (c) 2021 Microsoft
-# Licensed under The MIT License [see LICENSE for details]
-# Written by Ze Liu
+# Swin Transformer - Checkpointing REMOVED for PGD Compatibility
 # --------------------------------------------------------
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.utils.checkpoint as checkpoint
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 
 class Mlp(nn.Module):
@@ -90,7 +86,7 @@ class WindowAttention(nn.Module):
         trunc_normal_(self.relative_position_bias_table, std=.02)
         self.softmax = nn.Softmax(dim=-1)
 
-    # === [PATCH] Faithful JaSMin Helper (Robust) ===
+    # === [PATCH] Faithful JaSMin Helper (Robust + Safe) ===
     def _jasmin_norm(self, attn, eps=1e-12):
         # Safety Check: If window size shrunk to 1x1, we can't find top-2
         if attn.shape[-1] < 2:
@@ -115,13 +111,15 @@ class WindowAttention(nn.Module):
             self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1) 
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous() 
         attn = attn + relative_position_bias.unsqueeze(0)
+        
+        # --- FIXED: Removed checkpoint.checkpoint ---
         if mask is not None:
             nW = mask.shape[0]
             attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
             attn = attn.view(-1, self.num_heads, N, N)
-            attn = checkpoint.checkpoint(self.softmax, attn)
+            attn = self.softmax(attn) # Direct call
         else:
-            attn = checkpoint.checkpoint(self.softmax, attn)
+            attn = self.softmax(attn) # Direct call
 
         if self.training:
              self.last_jasmin = self._jasmin_norm(attn)
@@ -208,11 +206,14 @@ class SwinTransformerBlock(nn.Module):
                 x = x.transpose(-2, -1).contiguous().view(B, C, H, W)
                 x = deconv(x)
                 if i == 0:
-                    x = checkpoint.checkpoint(self.gelu2, x)
+                    # --- FIXED: Removed checkpoint.checkpoint ---
+                    x = self.gelu2(x) 
                     x = self.nin(x)
                     i = i + 1
                 x = x.view(B, C, -1).transpose(-2, -1).contiguous()
-                x = tmp_x + self.drop_path2(scale(checkpoint.checkpoint(act, x)))
+                # --- FIXED: Removed checkpoint.checkpoint ---
+                x = tmp_x + self.drop_path2(scale(act(x)))
+
         shortcut = x
         x = x.view(B, H, W, C)
         if self.shift_size > 0:
@@ -231,7 +232,8 @@ class SwinTransformerBlock(nn.Module):
         x = x.view(B, H * W, C)
         x = shortcut + self.drop_path(self.alpha1(x))
         x = self.norm1(x)
-        x = x + self.drop_path1(self.alpha2(checkpoint.checkpoint(self.mlp, x)))
+        # --- FIXED: Removed checkpoint.checkpoint ---
+        x = x + self.drop_path1(self.alpha2(self.mlp(x)))
         x = self.norm2(x)
         return x
     def extra_repr(self) -> str:
@@ -305,10 +307,8 @@ class BasicLayer(nn.Module):
             self.downsample = None
     def forward(self, x):
         for blk in self.blocks:
-            if self.use_checkpoint:
-                x = checkpoint.checkpoint(blk, x)
-            else:
-                x = blk(x)
+            # --- FIXED: Removed checkpointing condition ---
+            x = blk(x)
         if self.downsample is not None:
             x = self.downsample(x)
         return x
